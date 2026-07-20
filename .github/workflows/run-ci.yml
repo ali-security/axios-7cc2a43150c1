@@ -3,10 +3,10 @@ name: Continuous integration
 on:
   push:
     branches:
-      - "*"
-      - "*/*"
-      - "**"
-      - "!sponsors"
+      - '*'
+      - '*/*'
+      - '**'
+      - '!sponsors'
 
 permissions:
   contents: read
@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   ci:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     strategy:
       matrix:
