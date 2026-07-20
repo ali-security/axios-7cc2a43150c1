@@ -36,7 +36,26 @@ describe('supports fetch with nodejs', function () {
   });
 
   describe('responses', async () => {
-    it(`should support text response type`, async () => {
+    it('should sanitize request headers containing CRLF characters', async function () {
+    this.timeout(10000);
+    server = await startHTTPServer(
+      (req, res) => {
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ xTest: req.headers['x-test'], injected: req.headers.injected === undefined ? null : req.headers.injected }));
+      }
+    );
+    try {
+      const { data } = await fetchAxios.get(LOCAL_SERVER_URL + '/', {
+        headers: { 'x-test': '\tok\r\nInjected: yes ' },
+      });
+      assert.strictEqual(data.xTest, 'okInjected: yes');
+      assert.strictEqual(data.injected, null);
+    } finally {
+      await stopHTTPServer(server);
+    }
+  });
+
+  it(`should support text response type`, async () => {
       const originalData = 'my data';
 
       server = await startHTTPServer((req, res) => res.end(originalData));
@@ -514,6 +533,171 @@ describe('supports fetch with nodejs', function () {
         assert.strictEqual(data, 'global');
       } finally {
         fetch = globalFetch;
+      }
+    });
+  });
+ 
+  describe('size limits (GHSA-777c-7fjr-54vf)', () => {
+    it('should reject an outbound body that exceeds maxBodyLength with ERR_BAD_REQUEST', async () => {
+      const server = await startHTTPServer(
+        (req, res) => {
+          res.end('ok');
+        },
+        { port: 4444 }
+      );
+
+      try {
+        await assert.rejects(
+          fetchAxios.post(`${LOCAL_SERVER_URL}/`, 'A'.repeat(2048), {
+            maxBodyLength: 1024,
+          }),
+          (err) => {
+            assert.strictEqual(err.code, 'ERR_BAD_REQUEST');
+            assert.match(err.message, /Request body larger than maxBodyLength limit/);
+            return true;
+          }
+        );
+      } finally {
+        await stopHTTPServer(server);
+      }
+    });
+
+    it('should reject a response whose Content-Length exceeds maxContentLength with ERR_BAD_RESPONSE', async () => {
+      const payload = 'A'.repeat(8 * 1024);
+      const server = await startHTTPServer(
+        (req, res) => {
+          res.setHeader('Content-Length', Buffer.byteLength(payload));
+          res.end(payload);
+        },
+        { port: 4444 }
+      );
+
+      try {
+        await assert.rejects(
+          fetchAxios.get(`${LOCAL_SERVER_URL}/`, {
+            maxContentLength: 1024,
+          }),
+          (err) => {
+            assert.strictEqual(err.code, 'ERR_BAD_RESPONSE');
+            assert.match(err.message, /maxContentLength size of 1024 exceeded/);
+            return true;
+          }
+        );
+      } finally {
+        await stopHTTPServer(server);
+      }
+    });
+
+    it('should reject a chunked response that exceeds maxContentLength during streaming', async () => {
+      const server = await startHTTPServer(
+        (req, res) => {
+          // Omit content-length so the cheap pre-check cannot fire; force
+          // the stream-based enforcement path.
+          res.setHeader('Transfer-Encoding', 'chunked');
+          const chunk = 'B'.repeat(1024);
+          let sent = 0;
+          const writeNext = () => {
+            if (sent >= 8) {
+              return res.end();
+            }
+            sent++;
+            res.write(chunk, writeNext);
+          };
+          writeNext();
+        },
+        { port: 4444 }
+      );
+
+      try {
+        await assert.rejects(
+          fetchAxios.get(`${LOCAL_SERVER_URL}/`, {
+            maxContentLength: 512,
+          }),
+          (err) => {
+            assert.strictEqual(err.code, 'ERR_BAD_RESPONSE');
+            assert.match(err.message, /maxContentLength size of 512 exceeded/);
+            return true;
+          }
+        );
+      } finally {
+        await stopHTTPServer(server);
+      }
+    });
+
+    it('should reject a data: URL whose decoded size exceeds maxContentLength (base64)', async () => {
+      const payload = 'A'.repeat(4096);
+      const dataUrl = 'data:application/octet-stream;base64,' + Buffer.from(payload).toString('base64');
+
+      // Use a dedicated instance without baseURL — combineURLs would otherwise
+      // prepend baseURL to a data: URL and neutralise the pre-check.
+      const bareAxios = axios.create({ adapter: 'fetch' });
+
+      await assert.rejects(
+        bareAxios.get(dataUrl, { maxContentLength: 16 }),
+        (err) => {
+          assert.strictEqual(err.code, 'ERR_BAD_RESPONSE');
+          assert.match(err.message, /maxContentLength size of 16 exceeded/);
+          return true;
+        }
+      );
+    });
+
+    it('should reject a data: URL whose body size exceeds maxContentLength (non-base64)', async () => {
+      const dataUrl = 'data:text/plain,' + 'X'.repeat(4096);
+
+      const bareAxios = axios.create({ adapter: 'fetch' });
+
+      await assert.rejects(
+        bareAxios.get(dataUrl, { maxContentLength: 16 }),
+        (err) => {
+          assert.strictEqual(err.code, 'ERR_BAD_RESPONSE');
+          assert.match(err.message, /maxContentLength size of 16 exceeded/);
+          return true;
+        }
+      );
+    });
+
+    it('should allow a response at or below maxContentLength', async () => {
+      const payload = 'ok';
+      const server = await startHTTPServer(
+        (req, res) => {
+          res.end(payload);
+        },
+        { port: 4444 }
+      );
+
+      try {
+        const { data } = await fetchAxios.get(`${LOCAL_SERVER_URL}/`, {
+          maxContentLength: 1024,
+        });
+        assert.strictEqual(data, payload);
+      } finally {
+        await stopHTTPServer(server);
+      }
+    });
+
+    it('should allow a body at or below maxBodyLength', async () => {
+      const payload = 'hello';
+      let received;
+      const server = await startHTTPServer(
+        (req, res) => {
+          const chunks = [];
+          req.on('data', (c) => chunks.push(c));
+          req.on('end', () => {
+            received = Buffer.concat(chunks).toString();
+            res.end('ok');
+          });
+        },
+        { port: 4444 }
+      );
+
+      try {
+        await fetchAxios.post(`${LOCAL_SERVER_URL}/`, payload, {
+          maxBodyLength: 1024,
+        });
+        assert.strictEqual(received, payload);
+      } finally {
+        await stopHTTPServer(server);
       }
     });
   });
